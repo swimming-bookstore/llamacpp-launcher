@@ -262,12 +262,13 @@ impl Launch {
         pi: &Path,
         resolved: &llamacpp::catalog::Resolved,
     ) -> anyhow::Result<()> {
-        let loaded = load_model(base, &resolved.id, self.ctx).await?;
-        wait_loaded(base, &loaded.id).await?;
+        // The preset sets load-on-startup. POST /models/load would fail with
+        // "model is already running".
+        wait_loaded(base, &resolved.id).await?;
         if !self.no_configure {
-            let context = find_model(&list_models(base).await.unwrap_or_default(), &loaded.id)
+            let context = find_model(&list_models(base).await.unwrap_or_default(), &resolved.id)
                 .and_then(|model| model.context);
-            configure_pi(base, &loaded.id, context).await?;
+            configure_pi(base, &resolved.id, context).await?;
         }
         let mut args: Vec<String> = self
             .pi_args
@@ -280,7 +281,7 @@ impl Launch {
         // there. Pass the provider too: a bare id can match a logged-in
         // provider (xai) first and then fail.
         if !args.iter().any(|arg| arg == "--model" || arg == "-m") {
-            args.insert(0, loaded.id.clone());
+            args.insert(0, resolved.id.clone());
             args.insert(0, "--model".into());
         }
         if !args.iter().any(|arg| arg == "--provider") {
@@ -428,22 +429,6 @@ fn find_model(models: &[ModelInfo], query: &str) -> Option<ModelInfo> {
         return None;
     }
     Some(first)
-}
-
-async fn load_model(base: &str, model: &str, ctx: Option<u32>) -> anyhow::Result<ModelInfo> {
-    let models = list_models(base).await?;
-    let chosen = find_model(&models, model).ok_or_else(|| {
-        let known: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
-        anyhow!("no unique model matching `{model}` (known: {})", known.join(", "))
-    })?;
-    let mut body = json!({ "model": chosen.id });
-    if let Some(ctx) = ctx {
-        body["ctx_size"] = json!(ctx);
-    }
-    http(base, "POST", "/models/load", Some(&body))
-        .await
-        .with_context(|| format!("loading `{}`", chosen.id))?;
-    Ok(chosen)
 }
 
 async fn wait_loaded(base: &str, id: &str) -> anyhow::Result<()> {

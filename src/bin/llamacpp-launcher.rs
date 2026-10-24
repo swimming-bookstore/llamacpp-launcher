@@ -40,6 +40,13 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        CommandKind::Start(start) => match start.run().await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Error: {err:?}");
+                ExitCode::FAILURE
+            }
+        },
         CommandKind::Stop => match stop_server() {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -88,6 +95,8 @@ struct Cli {
 enum CommandKind {
     /// Load a model on the router and start a coding agent
     Launch(Launch),
+    /// Start llama-server in the background without Pi
+    Start(Start),
     /// Stop the llama-server this launcher started
     Stop,
     /// Describe what this install would do
@@ -146,9 +155,7 @@ impl CommandExecute for Uninstall {
 }
 
 #[derive(Debug, Parser)]
-struct Launch {
-    /// Coding agent to start. Only `pi` is supported.
-    agent: String,
+struct Server {
     /// Model to load. Only `flint`; Q4 / Q8 / BF16 is picked from RAM.
     #[clap(long)]
     model: String,
@@ -166,17 +173,11 @@ struct Launch {
     /// Do not offload, even when the card has enough video memory
     #[clap(long, conflicts_with = "gpu")]
     cpu: bool,
-    /// Do not write ~/.pi/agent/models.json or settings.json
-    #[clap(long)]
-    no_configure: bool,
     #[clap(flatten)]
     planner: Router,
-    /// Arguments after `--` are passed to Pi
-    #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
-    pi_args: Vec<String>,
 }
 
-impl Launch {
+impl Server {
     fn offload(&self) -> bool {
         if self.cpu {
             return false;
@@ -187,21 +188,15 @@ impl Launch {
         Machine::detect().offload()
     }
 
-    async fn run(self) -> anyhow::Result<()> {
-        if self.agent != "pi" {
-            anyhow::bail!("only `pi` is supported (got `{}`)", self.agent);
-        }
+    async fn ensure(&self) -> anyhow::Result<String> {
         if !self.model.eq_ignore_ascii_case("flint") {
             anyhow::bail!("only `flint` is supported (got `{}`)", self.model);
         }
         llamacpp::install::ensure(&APP, self.planner.clone()).await?;
-        let offload = self.offload();
-        let hf = llamacpp::catalog::flint_hf(offload)?;
-        let pi = which_pi()?;
+        let hf = llamacpp::catalog::flint_hf(self.offload())?;
         let base = common::router_url(&self.host, self.port);
         self.ensure_server(&base, &hf).await?;
-        let model = loaded_model(&base).await.unwrap_or_else(|_| hf.clone());
-        self.launch_pi(&base, &pi, &model).await
+        Ok(base)
     }
 
     /// One llama-server on host:port. Already up → reuse. Already starting →
@@ -256,10 +251,53 @@ impl Launch {
             .spawn()
             .with_context(|| format!("spawning {}", server.display()))
     }
+}
+
+#[derive(Debug, Parser)]
+struct Start {
+    #[clap(flatten)]
+    server: Server,
+}
+
+impl Start {
+    async fn run(self) -> anyhow::Result<()> {
+        let base = self.server.ensure().await?;
+        eprintln!("llama-server on {base}");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Parser)]
+struct Launch {
+    /// Coding agent to start. Only `pi` is supported.
+    agent: String,
+    #[clap(flatten)]
+    server: Server,
+    /// Do not write ~/.pi/agent/models.json or settings.json
+    #[clap(long)]
+    no_configure: bool,
+    /// Arguments after `--` are passed to Pi
+    #[clap(trailing_var_arg = true, allow_hyphen_values = true)]
+    pi_args: Vec<String>,
+}
+
+impl Launch {
+    async fn run(self) -> anyhow::Result<()> {
+        if self.agent != "pi" {
+            anyhow::bail!("only `pi` is supported (got `{}`)", self.agent);
+        }
+        let base = self.server.ensure().await?;
+        let pi = which_pi()?;
+        let model = match loaded_model(&base).await {
+            Ok(id) => id,
+            Err(_) => llamacpp::catalog::flint_hf(self.server.offload())?,
+        };
+        self.launch_pi(&base, &pi, &model).await
+    }
 
     async fn launch_pi(&self, base: &str, pi: &Path, model: &str) -> anyhow::Result<()> {
         if !self.no_configure {
-            configure_pi(base, model, self.ctx.map(u64::from)).await?;
+            configure_pi(base, model, self.server.ctx.map(u64::from)).await?;
         }
         let mut args: Vec<String> = self
             .pi_args

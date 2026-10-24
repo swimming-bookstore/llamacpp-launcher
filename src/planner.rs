@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use anyhow::Context;
 use installer::action::base::{
     CreateDirectory, FetchAndUnpackTarball, InstallBinary, InstallTree, ReleaseArchive,
     RequirePaths,
@@ -65,14 +66,12 @@ impl Planner for Router {
 
     async fn plan(&self) -> anyhow::Result<Vec<StatefulAction<Box<dyn Action>>>> {
         let dir = self.dir.clone().unwrap_or_else(common::dir);
-        // `~/.local/bin`. llama-server is dynamically linked against the .so files
-        // that ship next to it, so those land here too. Pi's tree cannot: this
-        // directory already holds the router, and InstallTree replaces its dest.
         let bin = common::bin_dir();
         let scratch = dir.join("unpack");
         let llama_unpack = scratch.join("llama");
+        let llama = common::llama_dir();
         let pi_unpack = scratch.join("pi");
-        let server = bin.join("llama-server");
+        let server = common::llama_server_path();
         // Beside package.json. `pi --version` reads that file from the directory
         // of the executable and prints 0.0.0 when it is missing.
         let pi = bin.join("pi-coding-agent").join("pi");
@@ -108,20 +107,12 @@ impl Planner for Router {
             CreateDirectory::plan(&models, None, None, Some(0o755), false).await?.boxed(),
             FetchAndUnpackTarball::plan(llama_archive, &llama_unpack).await?.boxed(),
             FetchAndUnpackTarball::plan(pi_archive, &pi_unpack).await?.boxed(),
-            // llama-server is dynamically linked against libllama-server-impl.so
-            // and friends, which ship in the same release directory. The directory
-            // name changes with the tag, so the tree is located by the library it
-            // always contains.
-            InstallTree::plan(
-                &llama_unpack,
-                "libllama-server-impl.so",
-                &bin,
-                None::<String>,
-                None::<String>,
-            )
-            .await?
-            .boxed(),
-            InstallBinary::plan(&llama_unpack, "llama-server", &server, None::<String>).await?.boxed(),
+            // llama-server is dynamically linked against the .so files that ship
+            // next to it. InstallTree matches a directory suffix, so the tree is
+            // the parent of `llama-server` rather than a file name.
+            InstallContainingTree::plan(&llama_unpack, "llama-server", &llama)
+                .await?
+                .boxed(),
             // Pi's compiled binary reads package.json from the directory of the
             // executable. InstallBinary alone leaves that file behind, and the
             // binary then reports 0.0.0. The release tree goes under
@@ -139,8 +130,7 @@ impl Planner for Router {
             .boxed(),
             InstallBinary::plan(&pi_unpack, "pi", &pi, None::<String>).await?.boxed(),
             // The launcher is this binary. Copy it into the scratch tree so
-            // InstallBinary can find it by name, the same way it finds llama-server.
-            // A symlink would be skipped: the archive search only counts real files.
+            // InstallBinary can find it by name. A symlink would be skipped.
             StageFile::plan(&launcher_src, scratch.join("self").join("llamacpp-launcher"))
                 .await?
                 .boxed(),
@@ -235,6 +225,84 @@ fn parse_backend(name: &str) -> anyhow::Result<crate::gpu::Backend> {
 
 fn json_string(value: impl ToString) -> serde_json::Value {
     serde_json::Value::String(value.to_string())
+}
+
+/// Copy the directory that contains `file` (llama-server and its `.so` files).
+#[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
+struct InstallContainingTree {
+    search_root: PathBuf,
+    file: String,
+    dest: PathBuf,
+}
+
+impl InstallContainingTree {
+    async fn plan(
+        search_root: impl Into<PathBuf>,
+        file: impl Into<String>,
+        dest: impl Into<PathBuf>,
+    ) -> anyhow::Result<StatefulAction<Self>> {
+        Ok(installer::action::StatefulAction::uncompleted(Self {
+            search_root: search_root.into(),
+            file: file.into(),
+            dest: dest.into(),
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+#[typetag::serde(name = "install_containing_tree")]
+impl Action for InstallContainingTree {
+    fn tracing_synopsis(&self) -> String {
+        format!(
+            "Install the directory containing `{}` to `{}`",
+            self.file,
+            self.dest.display()
+        )
+    }
+
+    fn tracing_span(&self) -> tracing::Span {
+        tracing::span!(tracing::Level::DEBUG, "install_containing_tree")
+    }
+
+    fn execute_description(&self) -> Vec<installer::action::ActionDescription> {
+        vec![installer::action::ActionDescription::new(
+            self.tracing_synopsis(),
+            vec![],
+        )]
+    }
+
+    async fn execute(&mut self) -> anyhow::Result<()> {
+        let source = installer::util::find_file(&self.search_root, &self.file)
+            .and_then(|path| path.parent().map(PathBuf::from))
+            .with_context(|| {
+                format!(
+                    "the release archive did not contain `{}`",
+                    self.file
+                )
+            })?;
+        installer::util::remove_dir_all_if_exists(&self.dest)
+            .await
+            .with_context(|| format!("removing `{}`", self.dest.display()))?;
+        tokio::fs::create_dir_all(&self.dest)
+            .await
+            .with_context(|| format!("creating `{}`", self.dest.display()))?;
+        installer::util::copy_dir_all(&source, &self.dest).await?;
+        Ok(())
+    }
+
+    fn revert_description(&self) -> Vec<installer::action::ActionDescription> {
+        vec![installer::action::ActionDescription::new(
+            format!("Remove `{}`", self.dest.display()),
+            vec![],
+        )]
+    }
+
+    async fn revert(&mut self) -> anyhow::Result<()> {
+        installer::util::remove_dir_all_if_exists(&self.dest)
+            .await
+            .with_context(|| format!("removing `{}`", self.dest.display()))?;
+        Ok(())
+    }
 }
 
 /// Copy one file into the scratch tree so a later [`InstallBinary`] can find it.

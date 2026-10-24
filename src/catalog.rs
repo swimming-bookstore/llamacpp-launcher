@@ -1,8 +1,6 @@
-//! Pins and Flint selection.
-//!
-//! `catalog.json` is bundled. `LLAMACPP_CATALOG` replaces it without a rebuild.
-//! The model is always Flint. The GGUF (Q4, Q8, or BF16) is picked from RAM,
-//! plus VRAM when layers go to the GPU. llama.cpp downloads it.
+//! Pins. `catalog.json` is bundled. `LLAMACPP_CATALOG` replaces it without a rebuild.
+//! Flint is `ggml-org/Flint-GGUF`; the quant (Q4, Q8, BF16) is picked from RAM
+//! (plus VRAM when layers go to the GPU) and passed as `-hf repo:quant`.
 
 use std::path::Path;
 
@@ -50,13 +48,12 @@ pub struct PiRelease {
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Flint {
     pub repo: String,
-    pub files: Vec<FlintFile>,
+    pub quants: Vec<FlintQuant>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct FlintFile {
-    pub id: String,
-    pub file: String,
+pub struct FlintQuant {
+    pub hf: String,
     pub gib: u64,
 }
 
@@ -111,7 +108,7 @@ fn parse(text: &str) -> anyhow::Result<Pins> {
         }
         require_sha256(&format!("llama.assets.{backend}.sha256"), &file.sha256)?;
     }
-    if pins.flint.repo.is_empty() || pins.flint.files.is_empty() {
+    if pins.flint.repo.is_empty() || pins.flint.quants.is_empty() {
         anyhow::bail!("catalog.json flint is missing");
     }
     Ok(pins)
@@ -125,54 +122,26 @@ fn require_sha256(field: &str, value: &str) -> anyhow::Result<()> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Resolved {
-    pub id: String,
-    pub repo: String,
-    pub file: String,
+/// `-hf` name llama.cpp should fetch for this machine.
+pub fn flint_hf(offload: bool) -> anyhow::Result<String> {
+    flint_hf_for(Machine::detect(), offload)
 }
 
-impl Resolved {
-    /// Router preset. llama.cpp fetches the GGUF.
-    pub fn preset(&self, ctx: u32, offload: bool) -> String {
-        let mut text = crate::common::preset_globals(ctx, offload);
-        text.push_str(&format!(
-            "\
-[{}]
-load-on-startup = true
-hf-repo = {}
-hf-file = {}
-",
-            self.id, self.repo, self.file
-        ));
-        text
-    }
-}
-
-/// Flint GGUF this machine can hold.
-pub fn flint(offload: bool) -> anyhow::Result<Resolved> {
-    flint_for(Machine::detect(), offload)
-}
-
-fn flint_for(machine: Machine, offload: bool) -> anyhow::Result<Resolved> {
+fn flint_hf_for(machine: Machine, offload: bool) -> anyhow::Result<String> {
     let pins = pins()?;
-    let file = pick(&pins.flint.files, machine, offload)
-        .context("catalog.json flint.files is empty")?;
-    Ok(Resolved {
-        id: file.id.clone(),
-        repo: pins.flint.repo.clone(),
-        file: file.file.clone(),
-    })
+    let quant = pick(&pins.flint.quants, machine, offload)
+        .context("catalog.json flint.quants is empty")?;
+    Ok(format!("{}:{}", pins.flint.repo, quant.hf))
 }
 
-fn pick(files: &[FlintFile], machine: Machine, offload: bool) -> Option<&FlintFile> {
+fn pick(quants: &[FlintQuant], machine: Machine, offload: bool) -> Option<&FlintQuant> {
     let ram = machine.ram.unwrap_or(0);
     let vram = if offload { machine.vram.unwrap_or(0) } else { 0 };
     let gib = (ram + vram) / (1024 * 1024 * 1024);
-    files
+    quants
         .iter()
-        .find(|file| gib >= file.gib + HEADROOM_GIB)
-        .or_else(|| files.last())
+        .find(|quant| gib >= quant.gib + HEADROOM_GIB)
+        .or_else(|| quants.last())
 }
 
 #[cfg(test)]
@@ -190,7 +159,6 @@ mod tests {
         assert_eq!(rocm.sha256.len(), 64);
         assert!(pins.pi.url.contains("pi-mono"));
         assert_eq!(pins.flint.repo, "ggml-org/Flint-GGUF");
-        assert!(pins.flint.files.iter().any(|f| f.file.ends_with(".gguf")));
     }
 
     #[test]
@@ -210,25 +178,8 @@ mod tests {
             vram: Some(48 * 1024 * 1024 * 1024),
             ram: Some(64 * 1024 * 1024 * 1024),
         };
-        assert_eq!(flint_for(q4, false).unwrap().file, "Flint-Q4_K_M.gguf");
-        assert_eq!(flint_for(q8, true).unwrap().file, "Flint-Q8_0.gguf");
-        assert_eq!(flint_for(bf16, true).unwrap().file, "Flint-BF16.gguf");
-    }
-
-    #[test]
-    fn flint_preset_asks_llama_cpp_to_fetch() {
-        let resolved = flint_for(
-            Machine {
-                backend: Backend::Cpu,
-                vram: None,
-                ram: Some(32 * 1024 * 1024 * 1024),
-            },
-            false,
-        )
-        .unwrap();
-        let preset = resolved.preset(2048, false);
-        assert!(preset.contains("[Flint-Q4_K_M]"));
-        assert!(preset.contains("hf-repo = ggml-org/Flint-GGUF"));
-        assert!(preset.contains("hf-file = Flint-Q4_K_M.gguf"));
+        assert_eq!(flint_hf_for(q4, false).unwrap(), "ggml-org/Flint-GGUF:Q4_K_M");
+        assert_eq!(flint_hf_for(q8, true).unwrap(), "ggml-org/Flint-GGUF:Q8_0");
+        assert_eq!(flint_hf_for(bf16, true).unwrap(), "ggml-org/Flint-GGUF:BF16");
     }
 }

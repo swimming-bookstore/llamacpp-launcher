@@ -4,8 +4,11 @@
 //! `~/.local/bin` if they are missing, starts the router, and execs Pi.
 //! `plan`, `install`, and `uninstall` are the same binary.
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
@@ -139,7 +142,7 @@ impl CommandExecute for Uninstall {
 struct Launch {
     /// Coding agent to start. Only `pi` is supported.
     agent: String,
-    /// Model to load. Only `flint` is supported; Q4 / Q8 / BF16 is picked from RAM.
+    /// Model to load. Only `flint`; Q4 / Q8 / BF16 is picked from RAM.
     #[clap(long)]
     model: String,
     #[clap(long, default_value = DEFAULT_HOST)]
@@ -189,13 +192,14 @@ impl Launch {
         }
         llamacpp::install::ensure(&APP, self.planner.clone()).await?;
         let offload = self.offload();
-        let resolved = llamacpp::catalog::flint(offload)?;
-        eprintln!("flint {}", resolved.file);
-        write_preset(&resolved.preset(self.ctx.unwrap_or(2048), offload)).await?;
+        let hf = llamacpp::catalog::flint_hf(offload)?;
+        eprintln!("llama-server -hf {hf}");
         let pi = which_pi()?;
 
-        // Always start our own llama-server so it reads this launch's preset.
-        // Reusing a listener would ignore hf-repo / n-gpu-layers we just wrote.
+        // Stop leftover llama-server processes from earlier launches, then
+        // again when Pi exits (Drop, including Ctrl-C).
+        stop_our_llama_servers();
+        wait_port_free(&self.host, self.port).await;
         let port = if tcp_open(&self.host, self.port).await {
             let free = free_port(&self.host).await?;
             eprintln!(
@@ -207,70 +211,54 @@ impl Launch {
         } else {
             self.port
         };
-        let mut child = self.start_router(port).await?;
+        let mut child = self.start_server(port, &hf).await?;
+        let show = pipe_progress(&mut child);
+        let mut router = RouterProc {
+            child: &mut child,
+            keep: self.keep_server,
+        };
         let base = common::router_url(&self.host, port);
-        let result = self.launch_pi(&base, &pi, &resolved).await;
-        if !self.keep_server {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-        }
+        let work = async {
+            wait_ready(&base, router.child).await?;
+            // Stop printing. llama-server request logs would land in Pi's composer.
+            show.store(false, Ordering::Relaxed);
+            let _ = io::stderr().write_all(b"\n");
+            let model = loaded_model(&base).await.unwrap_or_else(|_| hf.clone());
+            self.launch_pi(&base, &pi, &model).await
+        };
+        let result = tokio::select! {
+            result = work => result,
+            _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted")),
+        };
+        router.stop();
         result
     }
 
-    async fn start_router(&self, port: u16) -> anyhow::Result<Child> {
+    async fn start_server(&self, port: u16, hf: &str) -> anyhow::Result<Child> {
         let server = which_server()?;
-        let models = common::models_dir();
-        tokio::fs::create_dir_all(&models)
-            .await
-            .with_context(|| format!("creating {}", models.display()))?;
-        let log = common::dir().join("llama-server.log");
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log)
-            .with_context(|| format!("opening {}", log.display()))?;
-        // Pi is an Ink TUI. Inheriting this process's stderr writes llama-server's
-        // request log into the composer. Keep it in a file instead.
-        let child = Command::new(&server)
-            .arg("--host")
+        let mut cmd = Command::new(&server);
+        cmd.arg("--host")
             .arg(&self.host)
             .arg("--port")
             .arg(port.to_string())
-            .arg("--models-dir")
-            .arg(&models)
-            .arg("--models-preset")
-            .arg(common::preset_path())
-            .arg("--models-max")
-            .arg("1")
+            .arg("-hf")
+            .arg(hf)
             .arg("-ngl")
-            .arg(if self.offload() { "999" } else { "0" })
-            .stdin(Stdio::null())
-            .stdout(log_file.try_clone()?)
-            .stderr(log_file)
-            .spawn()
-            .with_context(|| format!("spawning {}", server.display()))?;
-        eprintln!("llama-server log: {}", log.display());
-
-        let base = common::router_url(&self.host, port);
-        for _ in 0..50 {
-            if probe(&base).await {
-                return Ok(child);
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            .arg(if self.offload() { "999" } else { "0" });
+        if let Some(ctx) = self.ctx {
+            cmd.arg("--ctx-size").arg(ctx.to_string());
         }
-        anyhow::bail!("router on {base} did not become ready");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .with_context(|| format!("spawning {}", server.display()))
     }
 
-    async fn launch_pi(
-        &self,
-        base: &str,
-        pi: &Path,
-        resolved: &llamacpp::catalog::Resolved,
-    ) -> anyhow::Result<()> {
-        // Do not wait for the GGUF. llama-server loads it in the background, and
-        // /v1/models can hang the whole time. Pi only needs models.json.
+    async fn launch_pi(&self, base: &str, pi: &Path, model: &str) -> anyhow::Result<()> {
         if !self.no_configure {
-            configure_pi(base, &resolved.id, self.ctx.map(u64::from)).await?;
+            configure_pi(base, model, self.ctx.map(u64::from)).await?;
         }
         let mut args: Vec<String> = self
             .pi_args
@@ -279,11 +267,10 @@ impl Launch {
             .cloned()
             .collect();
         // `--model` is resolved against models.json before the llama.cpp
-        // extension fetches the router catalog, so the id has to be declared
-        // there. Pass the provider too: a bare id can match a logged-in
-        // provider (xai) first and then fail.
+        // extension fetches the catalog, so the id has to be declared there.
+        // Pass the provider too: a bare id can match a logged-in provider first.
         if !args.iter().any(|arg| arg == "--model" || arg == "-m") {
-            args.insert(0, resolved.id.clone());
+            args.insert(0, model.to_string());
             args.insert(0, "--model".into());
         }
         if !args.iter().any(|arg| arg == "--provider") {
@@ -303,13 +290,101 @@ impl Launch {
     }
 }
 
-async fn write_preset(body: &str) -> anyhow::Result<()> {
-    let path = common::preset_path();
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir).await?;
+struct RouterProc<'a> {
+    child: &'a mut Child,
+    keep: bool,
+}
+
+impl RouterProc<'_> {
+    fn stop(&mut self) {
+        if self.keep {
+            return;
+        }
+        stop_group(self.child.id());
+        let _ = self.child.start_kill();
+        stop_our_llama_servers();
     }
-    tokio::fs::write(&path, body).await?;
-    Ok(())
+}
+
+impl Drop for RouterProc<'_> {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// SIGKILL every process whose executable is our installed llama-server.
+/// That includes the router and the model children it forks.
+fn stop_our_llama_servers() {
+    let Ok(server) = which_server() else {
+        return;
+    };
+    let Ok(want) = std::fs::canonicalize(&server) else {
+        return;
+    };
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return;
+    };
+    let me = std::process::id();
+    for entry in proc.flatten() {
+        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
+            Some(pid) if pid != me => pid,
+            _ => continue,
+        };
+        let exe = match std::fs::read_link(entry.path().join("exe")) {
+            Ok(exe) => exe,
+            Err(_) => continue,
+        };
+        if exe == want {
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+fn stop_group(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    unsafe {
+        libc::killpg(pid as i32, libc::SIGKILL);
+    }
+}
+
+/// Print llama-server output until the model is up, then drain it.
+fn pipe_progress(child: &mut Child) -> Arc<AtomicBool> {
+    let show = Arc::new(AtomicBool::new(true));
+    if let Some(stdout) = child.stdout.take() {
+        tokio::spawn(drain(stdout, show.clone()));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(drain(stderr, show.clone()));
+    }
+    show
+}
+
+async fn drain(mut stream: impl tokio::io::AsyncRead + Unpin, show: Arc<AtomicBool>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if show.load(Ordering::Relaxed) {
+                    let _ = io::stderr().write_all(&buf[..n]);
+                    let _ = io::stderr().flush();
+                }
+            }
+        }
+    }
+}
+
+async fn wait_port_free(host: &str, port: u16) {
+    for _ in 0..50 {
+        if !tcp_open(host, port).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn which_server() -> anyhow::Result<PathBuf> {
@@ -339,17 +414,45 @@ fn which(name: &str) -> anyhow::Result<PathBuf> {
     Err(anyhow!("`{name}` not on PATH"))
 }
 
-/// True only when the listener is llama-server. `/health` on that binary is JSON
-/// (`{"status":"ok"}` once a model is up, or a models object in router mode).
-async fn probe(base: &str) -> bool {
+/// `-hf` llama-server only answers `/health` with `{"status":"ok"}` after the
+/// GGUF is loaded. A download keeps the port closed until then.
+async fn wait_ready(base: &str, child: &mut Child) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2 * 60 * 60);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("llama-server exited with {status}");
+        }
+        if health_ok(base).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("llama-server on {base} did not become ready");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn health_ok(base: &str) -> bool {
     let Ok(body) = http(base, "GET", "/health", None).await else {
         return false;
     };
     let Ok(value) = serde_json::from_str::<Value>(body.trim()) else {
         return false;
     };
-    let status = value.get("status").and_then(|v| v.as_str());
-    status == Some("ok") || value.get("models").is_some() || status == Some("no slot available")
+    value.get("status").and_then(|v| v.as_str()) == Some("ok")
+}
+
+async fn loaded_model(base: &str) -> anyhow::Result<String> {
+    let body = http(base, "GET", "/v1/models", None).await?;
+    let value: Value = serde_json::from_str(body.trim()).context("parsing /v1/models")?;
+    value
+        .get("data")
+        .and_then(|v| v.as_array())
+        .and_then(|data| data.first())
+        .and_then(|item| item.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .context("llama-server listed no models")
 }
 
 async fn tcp_open(host: &str, port: u16) -> bool {

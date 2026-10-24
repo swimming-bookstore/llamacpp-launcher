@@ -16,7 +16,7 @@ use crate::common;
 /// Install the router, Pi, and this launcher.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, clap::Parser)]
 pub struct Router {
-    /// This launcher's directory: receipt, unpack, preset, log. Defaults to
+    /// This launcher's directory: receipt, unpack, log. Defaults to
     /// `~/.llamacpp-launcher`. Binaries still go to `~/.local/bin`.
     #[clap(long, env = "LLAMACPP_DIR")]
     pub dir: Option<PathBuf>,
@@ -73,7 +73,6 @@ impl Planner for Router {
         let server = common::llama_server_path();
         let pi = common::pi_path();
         let launcher = bin.join("llamacpp-launcher");
-        let models = dir.join("models");
 
         let asset = self.llama_asset()?;
         let llama_sha = self.llama_sha256.clone().unwrap_or_else(|| asset.sha256.clone());
@@ -101,7 +100,6 @@ impl Planner for Router {
         let mut actions: Vec<StatefulAction<Box<dyn Action>>> = vec![
             CreateDirectory::plan(&bin, None, None, Some(0o755), false).await?.boxed(),
             CreateDirectory::plan(&dir, None, None, Some(0o755), false).await?.boxed(),
-            CreateDirectory::plan(&models, None, None, Some(0o755), false).await?.boxed(),
             FetchAndUnpackTarball::plan(llama_archive, &llama_unpack).await?.boxed(),
             FetchAndUnpackTarball::plan(pi_archive, &pi_unpack).await?.boxed(),
             // llama-server is dynamically linked against the .so files that ship

@@ -736,6 +736,7 @@ dependencies = [
  "async-trait",
  "clap",
  "installer",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

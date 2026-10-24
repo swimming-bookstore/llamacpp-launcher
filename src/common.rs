@@ -77,6 +77,14 @@ pub fn receipt_path() -> PathBuf {
     dir().join("install-receipt.json")
 }
 
+pub fn pid_path() -> PathBuf {
+    dir().join("llama-server.pid")
+}
+
+pub fn log_path() -> PathBuf {
+    dir().join("llama-server.log")
+}
+
 pub fn router_url(host: &str, port: u16) -> String {
     format!("http://{host}:{port}")
 }

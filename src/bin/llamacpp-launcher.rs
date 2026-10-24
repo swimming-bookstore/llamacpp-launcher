@@ -40,6 +40,13 @@ async fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        CommandKind::Stop => match stop_server() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("Error: {err:?}");
+                ExitCode::FAILURE
+            }
+        },
         CommandKind::Plan(cmd) => install_cmd(cli.instrumentation, cmd.execute()).await,
         CommandKind::Install(cmd) => install_cmd(cli.instrumentation, cmd.execute()).await,
         CommandKind::Uninstall(cmd) => install_cmd(cli.instrumentation, cmd.execute()).await,
@@ -81,6 +88,8 @@ struct Cli {
 enum CommandKind {
     /// Load a model on the router and start a coding agent
     Launch(Launch),
+    /// Stop the llama-server this launcher started
+    Stop,
     /// Describe what this install would do
     Plan(Plan),
     /// Install the router, Pi, and this launcher
@@ -209,13 +218,15 @@ impl Launch {
             anyhow::bail!("{base} is in use by something that is not llama-server");
         }
         eprintln!("llama-server -hf {hf}");
-        let log = common::dir().join("llama-server.log");
+        let log = common::log_path();
         if let Some(dir) = log.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
         let offset = tokio::fs::metadata(&log).await.map(|m| m.len()).unwrap_or(0);
         let child = self.start_server(hf, &log).await?;
-        wait_ready(base, Some(&log), offset, child.id()).await
+        let pid = child.id().context("llama-server pid")?;
+        write_pid(pid)?;
+        wait_ready(base, Some(&log), offset, Some(pid)).await
     }
 
     async fn start_server(&self, hf: &str, log: &Path) -> anyhow::Result<Child> {
@@ -277,6 +288,105 @@ impl Launch {
             anyhow::bail!("pi exited with {status}");
         }
         Ok(())
+    }
+}
+
+fn write_pid(pid: u32) -> anyhow::Result<()> {
+    let path = common::pid_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, format!("{pid}\n")).with_context(|| format!("writing {}", path.display()))
+}
+
+fn read_pid(path: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.trim().parse().ok()
+}
+
+fn our_llama_server(pid: u32) -> bool {
+    let Ok(server) = which_server() else {
+        return false;
+    };
+    let Ok(want) = std::fs::canonicalize(&server) else {
+        return false;
+    };
+    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == want)
+}
+
+fn stop_server() -> anyhow::Result<()> {
+    let path = common::pid_path();
+    let recorded = read_pid(&path);
+    let mut stopped = false;
+    if let Some(pid) = recorded {
+        if our_llama_server(pid) {
+            kill_group(pid);
+            stopped = true;
+        }
+    }
+    for pid in our_llama_server_pids() {
+        kill_pid(pid);
+        stopped = true;
+    }
+    let _ = std::fs::remove_file(&path);
+    if stopped {
+        eprintln!("stopped llama-server");
+    } else {
+        eprintln!("llama-server is not running");
+    }
+    Ok(())
+}
+
+fn our_llama_server_pids() -> Vec<u32> {
+    let Ok(server) = which_server() else {
+        return Vec::new();
+    };
+    let Ok(want) = std::fs::canonicalize(&server) else {
+        return Vec::new();
+    };
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let me = std::process::id();
+    proc.flatten()
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            if pid == me {
+                return None;
+            }
+            let exe = std::fs::read_link(entry.path().join("exe")).ok()?;
+            (exe == want).then_some(pid)
+        })
+        .collect()
+}
+
+fn kill_group(pid: u32) {
+    unsafe {
+        libc::killpg(pid as i32, libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if !pid_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unsafe {
+        libc::killpg(pid as i32, libc::SIGKILL);
+    }
+}
+
+fn kill_pid(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if !pid_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
     }
 }
 

@@ -1,7 +1,7 @@
 //! `llamacpp-launcher launch pi --model flint`
 //!
-//! Installs llama.cpp and Pi into `~/.local/bin` if they are missing, starts
-//! the router, and execs Pi. App files live in `~/.llamacpp-launcher`.
+//! Installs llama.cpp under `~/.llamacpp-launcher/llama` and Pi into
+//! `~/.local/bin` if they are missing, starts the router, and execs Pi.
 //! `plan`, `install`, and `uninstall` are the same binary.
 
 use std::path::{Path, PathBuf};

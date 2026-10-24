@@ -42,8 +42,14 @@ pub fn bin_dir() -> PathBuf {
         .unwrap_or_else(|| home_dir().join(".local").join("bin"))
 }
 
+/// Unpacked llama.cpp tree. `llama-server` is dynamically linked against the
+/// `.so` files that ship next to it, so the whole release stays together.
+pub fn llama_dir() -> PathBuf {
+    dir().join("llama")
+}
+
 pub fn llama_server_path() -> PathBuf {
-    bin_dir().join("llama-server")
+    llama_dir().join("llama-server")
 }
 
 pub fn pi_path() -> PathBuf {

@@ -47,6 +47,8 @@ pub struct Machine {
     pub backend: Backend,
     /// Largest video memory seen, in bytes. `None` when it could not be read.
     pub vram: Option<u64>,
+    /// Total RAM from `/proc/meminfo`. `None` when it could not be read.
+    pub ram: Option<u64>,
 }
 
 impl Machine {
@@ -63,7 +65,11 @@ impl Machine {
         } else {
             Backend::Cpu
         };
-        Self { backend, vram }
+        Self {
+            backend,
+            vram,
+            ram: ram(),
+        }
     }
 
     /// `-ngl 999` only when a card has enough video memory to hold a real model.
@@ -104,6 +110,18 @@ fn drm_gpus() -> Vec<DrmGpu> {
         });
     }
     gpus
+}
+
+fn ram() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("MemTotal:") else {
+            continue;
+        };
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        return Some(kb * 1024);
+    }
+    None
 }
 
 fn read_hex(path: &Path) -> Option<u32> {
@@ -149,18 +167,26 @@ mod tests {
         let small = Machine {
             backend: Backend::Vulkan,
             vram: Some(2 * 1024 * 1024 * 1024),
+            ram: None,
         };
         let unknown = Machine {
             backend: Backend::Rocm,
             vram: None,
+            ram: None,
         };
         let large = Machine {
             backend: Backend::Rocm,
             vram: Some(16 * 1024 * 1024 * 1024),
+            ram: None,
         };
         assert!(!small.offload());
         assert!(!unknown.offload());
         assert!(large.offload());
-        assert!(!Machine { backend: Backend::Cpu, vram: Some(LARGE_VRAM) }.offload());
+        assert!(!Machine {
+            backend: Backend::Cpu,
+            vram: Some(LARGE_VRAM),
+            ram: None,
+        }
+        .offload());
     }
 }

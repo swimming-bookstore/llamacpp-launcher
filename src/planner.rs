@@ -5,8 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use installer::action::base::{
-    CreateDirectory, FetchAndUnpackTarball, InstallBinary, InstallTree, ReleaseArchive,
-    RequirePaths,
+    CreateDirectory, FetchAndUnpackTarball, ReleaseArchive, RequirePaths,
 };
 use installer::action::{Action, StatefulAction};
 use installer::planner::{diff_from_default, Planner};
@@ -72,9 +71,7 @@ impl Planner for Router {
         let llama = common::llama_dir();
         let pi_unpack = scratch.join("pi");
         let server = common::llama_server_path();
-        // Beside package.json. `pi --version` reads that file from the directory
-        // of the executable and prints 0.0.0 when it is missing.
-        let pi = bin.join("pi-coding-agent").join("pi");
+        let pi = common::pi_path();
         let launcher = bin.join("llamacpp-launcher");
         let models = dir.join("models");
 
@@ -110,33 +107,21 @@ impl Planner for Router {
             // llama-server is dynamically linked against the .so files that ship
             // next to it. InstallTree matches a directory suffix, so the tree is
             // the parent of `llama-server` rather than a file name.
-            InstallContainingTree::plan(&llama_unpack, "llama-server", &llama)
+            InstallContainingTree::plan(&llama_unpack, "llama-server", None, &llama)
                 .await?
                 .boxed(),
-            // Pi's compiled binary reads package.json from the directory of the
-            // executable. InstallBinary alone leaves that file behind, and the
-            // binary then reports 0.0.0. The release tree goes under
-            // `~/.local/bin/pi-coding-agent/`, and `install` puts the real `pi`
-            // binary in that same directory. Matching `pi/pi` skips the example
-            // packages, which also contain package.json.
-            InstallTree::plan(
+            // Pi reads package.json from the directory of the executable.
+            // The sibling filter skips example packages that also ship a `pi` file.
+            // The framework's InstallBinary always `install -o root`, which a user cannot do.
+            InstallContainingTree::plan(
                 &pi_unpack,
-                "pi/pi",
+                "pi",
+                Some("package.json".into()),
                 bin.join("pi-coding-agent"),
-                None::<String>,
-                None::<String>,
             )
             .await?
             .boxed(),
-            InstallBinary::plan(&pi_unpack, "pi", &pi, None::<String>).await?.boxed(),
-            // The launcher is this binary. Copy it into the scratch tree so
-            // InstallBinary can find it by name. A symlink would be skipped.
-            StageFile::plan(&launcher_src, scratch.join("self").join("llamacpp-launcher"))
-                .await?
-                .boxed(),
-            InstallBinary::plan(scratch.join("self"), "llamacpp-launcher", &launcher, None::<String>)
-                .await?
-                .boxed(),
+            InstallFile::plan(&launcher_src, &launcher).await?.boxed(),
         ];
 
         // The router is not a service. `llamacpp-launcher` starts it in the
@@ -227,11 +212,12 @@ fn json_string(value: impl ToString) -> serde_json::Value {
     serde_json::Value::String(value.to_string())
 }
 
-/// Copy the directory that contains `file` (llama-server and its `.so` files).
+/// Copy the directory that contains `file` (and optionally a sibling).
 #[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
 struct InstallContainingTree {
     search_root: PathBuf,
     file: String,
+    sibling: Option<String>,
     dest: PathBuf,
 }
 
@@ -239,11 +225,13 @@ impl InstallContainingTree {
     async fn plan(
         search_root: impl Into<PathBuf>,
         file: impl Into<String>,
+        sibling: impl Into<Option<String>>,
         dest: impl Into<PathBuf>,
     ) -> anyhow::Result<StatefulAction<Self>> {
         Ok(installer::action::StatefulAction::uncompleted(Self {
             search_root: search_root.into(),
             file: file.into(),
+            sibling: sibling.into(),
             dest: dest.into(),
         }))
     }
@@ -272,14 +260,8 @@ impl Action for InstallContainingTree {
     }
 
     async fn execute(&mut self) -> anyhow::Result<()> {
-        let source = installer::util::find_file(&self.search_root, &self.file)
-            .and_then(|path| path.parent().map(PathBuf::from))
-            .with_context(|| {
-                format!(
-                    "the release archive did not contain `{}`",
-                    self.file
-                )
-            })?;
+        let source = find_containing_dir(&self.search_root, &self.file, self.sibling.as_deref())
+            .with_context(|| format!("the release archive did not contain `{}`", self.file))?;
         installer::util::remove_dir_all_if_exists(&self.dest)
             .await
             .with_context(|| format!("removing `{}`", self.dest.display()))?;
@@ -305,17 +287,42 @@ impl Action for InstallContainingTree {
     }
 }
 
-/// Copy one file into the scratch tree so a later [`InstallBinary`] can find it.
-///
-/// Revert removes only the staged copy. The installed binary is removed by
-/// [`InstallBinary`]'s own revert.
+fn find_containing_dir(root: &std::path::Path, file: &str, sibling: Option<&str>) -> Option<PathBuf> {
+    fn walk(dir: &std::path::Path, file: &str, sibling: Option<&str>, hits: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                walk(&path, file, sibling, hits);
+            } else if kind.is_file() && entry.file_name() == file {
+                if let Some(parent) = path.parent() {
+                    if sibling.is_none_or(|name| parent.join(name).is_file()) {
+                        hits.push(parent.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    let mut hits = Vec::new();
+    walk(root, file, sibling, &mut hits);
+    hits.into_iter().min_by_key(|path| path.components().count())
+}
+
+/// Copy one file. Unlike the framework's `InstallBinary`, this does not `chown root`.
 #[derive(Debug, serde::Deserialize, serde::Serialize, Clone)]
-struct StageFile {
+struct InstallFile {
     source: PathBuf,
     dest: PathBuf,
 }
 
-impl StageFile {
+impl InstallFile {
     async fn plan(
         source: impl Into<PathBuf>,
         dest: impl Into<PathBuf>,
@@ -328,18 +335,14 @@ impl StageFile {
 }
 
 #[async_trait::async_trait]
-#[typetag::serde(name = "stage_file")]
-impl Action for StageFile {
+#[typetag::serde(name = "install_file")]
+impl Action for InstallFile {
     fn tracing_synopsis(&self) -> String {
-        format!(
-            "Stage `{}` at `{}`",
-            self.source.display(),
-            self.dest.display()
-        )
+        format!("Install `{}`", self.dest.display())
     }
 
     fn tracing_span(&self) -> tracing::Span {
-        tracing::span!(tracing::Level::DEBUG, "stage_file")
+        tracing::span!(tracing::Level::DEBUG, "install_file")
     }
 
     fn execute_description(&self) -> Vec<installer::action::ActionDescription> {
@@ -350,26 +353,20 @@ impl Action for StageFile {
     }
 
     async fn execute(&mut self) -> anyhow::Result<()> {
-        if let Some(parent) = self.dest.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        tokio::fs::copy(&self.source, &self.dest)
-            .await
-            .map_err(|err| anyhow::anyhow!("staging `{}`: {err}", self.source.display()))?;
-        Ok(())
+        installer::util::install_file(&self.source, &self.dest, 0o755, None).await
     }
 
     fn revert_description(&self) -> Vec<installer::action::ActionDescription> {
         vec![installer::action::ActionDescription::new(
-            format!("Remove staged `{}`", self.dest.display()),
+            format!("Remove `{}`", self.dest.display()),
             vec![],
         )]
     }
 
     async fn revert(&mut self) -> anyhow::Result<()> {
-        if self.dest.is_file() {
-            tokio::fs::remove_file(&self.dest).await.ok();
-        }
+        installer::util::remove_file_if_exists(&self.dest)
+            .await
+            .with_context(|| format!("removing `{}`", self.dest.display()))?;
         Ok(())
     }
 }

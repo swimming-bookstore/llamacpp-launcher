@@ -23,10 +23,10 @@
   },
   "flint": {
     "repo": "ggml-org/Flint-GGUF",
-    "files": [
-      { "id": "Flint-BF16", "file": "Flint-BF16.gguf", "gib": 80 },
-      { "id": "Flint-Q8_0", "file": "Flint-Q8_0.gguf", "gib": 42 },
-      { "id": "Flint-Q4_K_M", "file": "Flint-Q4_K_M.gguf", "gib": 24 }
+    "quants": [
+      { "hf": "BF16", "gib": 80 },
+      { "hf": "Q8_0", "gib": 42 },
+      { "hf": "Q4_K_M", "gib": 24 }
     ]
   }
 }

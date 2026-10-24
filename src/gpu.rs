@@ -86,6 +86,18 @@ struct DrmGpu {
     vram: Option<u64>,
 }
 
+fn ram() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("MemTotal:") else {
+            continue;
+        };
+        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+        return Some(kb * 1024);
+    }
+    None
+}
+
 fn drm_gpus() -> Vec<DrmGpu> {
     let Ok(entries) = std::fs::read_dir("/sys/class/drm") else {
         return Vec::new();
@@ -110,18 +122,6 @@ fn drm_gpus() -> Vec<DrmGpu> {
         });
     }
     gpus
-}
-
-fn ram() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("MemTotal:") else {
-            continue;
-        };
-        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-        return Some(kb * 1024);
-    }
-    None
 }
 
 fn read_hex(path: &Path) -> Option<u32> {

@@ -139,7 +139,7 @@ impl CommandExecute for Uninstall {
 struct Launch {
     /// Coding agent to start. Only `pi` is supported.
     agent: String,
-    /// Router model id, unique substring, GGUF filename, or path
+    /// Model to load. Only `flint` is supported; Q4 / Q8 / BF16 is picked from RAM.
     #[clap(long)]
     model: String,
     #[clap(long, default_value = DEFAULT_HOST)]
@@ -184,9 +184,14 @@ impl Launch {
         if self.agent != "pi" {
             anyhow::bail!("only `pi` is supported (got `{}`)", self.agent);
         }
+        if !self.model.eq_ignore_ascii_case("flint") {
+            anyhow::bail!("only `flint` is supported (got `{}`)", self.model);
+        }
         llamacpp::install::ensure(&APP, self.planner.clone()).await?;
-        let resolved = llamacpp::catalog::resolve(&self.model, &common::models_dir())?;
-        write_preset(&resolved.preset(self.ctx.unwrap_or(2048), self.offload())).await?;
+        let offload = self.offload();
+        let resolved = llamacpp::catalog::flint(offload)?;
+        eprintln!("flint {}", resolved.file);
+        write_preset(&resolved.preset(self.ctx.unwrap_or(2048), offload)).await?;
         let pi = which_pi()?;
 
         // Always start our own llama-server so it reads this launch's preset.
@@ -262,13 +267,10 @@ impl Launch {
         pi: &Path,
         resolved: &llamacpp::catalog::Resolved,
     ) -> anyhow::Result<()> {
-        // The preset sets load-on-startup. POST /models/load would fail with
-        // "model is already running".
-        wait_loaded(base, &resolved.id).await?;
+        // Do not wait for the GGUF. llama-server loads it in the background, and
+        // /v1/models can hang the whole time. Pi only needs models.json.
         if !self.no_configure {
-            let context = find_model(&list_models(base).await.unwrap_or_default(), &resolved.id)
-                .and_then(|model| model.context);
-            configure_pi(base, &resolved.id, context).await?;
+            configure_pi(base, &resolved.id, self.ctx.map(u64::from)).await?;
         }
         let mut args: Vec<String> = self
             .pi_args
@@ -299,16 +301,6 @@ impl Launch {
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone)]
-struct ModelInfo {
-    id: String,
-    path: Option<String>,
-    status: Option<String>,
-    failed: bool,
-    exit_code: Option<i64>,
-    context: Option<u64>,
 }
 
 async fn write_preset(body: &str) -> anyhow::Result<()> {
@@ -371,83 +363,6 @@ async fn free_port(host: &str) -> anyhow::Result<u16> {
         }
     }
     anyhow::bail!("no free port for llama-server on {host}")
-}
-
-async fn list_models(base: &str) -> anyhow::Result<Vec<ModelInfo>> {
-    let body = http(base, "GET", "/v1/models", None).await?;
-    let value: Value = serde_json::from_str(&body).context("parsing /v1/models")?;
-    let data = value.get("data").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-    Ok(data
-        .into_iter()
-        .filter_map(|item| {
-            let id = item.get("id")?.as_str()?.to_string();
-            let path = item
-                .pointer("/status/args")
-                .and_then(|v| v.as_array())
-                .and_then(|args| {
-                    args.windows(2).find_map(|pair| {
-                        (pair[0].as_str() == Some("--model")).then(|| pair[1].as_str().map(str::to_string))
-                    })
-                })
-                .flatten()
-                .or_else(|| item.get("path").and_then(|v| v.as_str()).map(str::to_string));
-            let status = item
-                .pointer("/status/value")
-                .and_then(|v| v.as_str())
-                .or_else(|| item.get("status").and_then(|v| v.as_str()))
-                .map(str::to_string);
-            let failed = item.pointer("/status/failed").and_then(|v| v.as_bool()).unwrap_or(false);
-            let exit_code = item.pointer("/status/exit_code").and_then(|v| v.as_i64());
-            let context = item.get("context_length").and_then(|v| v.as_u64());
-            Some(ModelInfo {
-                id,
-                path,
-                status,
-                failed,
-                exit_code,
-                context,
-            })
-        })
-        .collect())
-}
-
-fn find_model(models: &[ModelInfo], query: &str) -> Option<ModelInfo> {
-    if let Some(exact) = models.iter().find(|m| m.id == query) {
-        return Some(exact.clone());
-    }
-    let needle = query.to_ascii_lowercase();
-    let mut hits = models.iter().filter(|m| {
-        m.id.to_ascii_lowercase().contains(&needle)
-            || m.path
-                .as_deref()
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .contains(&needle)
-    });
-    let first = hits.next().cloned()?;
-    if hits.next().is_some() {
-        return None;
-    }
-    Some(first)
-}
-
-async fn wait_loaded(base: &str, id: &str) -> anyhow::Result<()> {
-    // First load can be a Hugging Face download; llama.cpp does that itself.
-    for _ in 0..3600 {
-        if let Some(model) = find_model(&list_models(base).await.unwrap_or_default(), id) {
-            if model.status.as_deref() == Some("loaded") {
-                return Ok(());
-            }
-            if model.failed {
-                anyhow::bail!(
-                    "model `{id}` failed to load (exit {})",
-                    model.exit_code.unwrap_or(1)
-                );
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    anyhow::bail!("model `{id}` did not finish loading");
 }
 
 async fn configure_pi(base: &str, model: &str, context: Option<u64>) -> anyhow::Result<()> {
@@ -557,12 +472,16 @@ async fn http(
     request.push_str("\r\n");
     request.push_str(&payload);
 
-    let mut stream = TcpStream::connect((host.as_str(), port))
+    let mut stream = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect((host.as_str(), port)))
         .await
+        .with_context(|| format!("connecting to {base}"))?
         .with_context(|| format!("connecting to {base}"))?;
     stream.write_all(request.as_bytes()).await?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buf))
+        .await
+        .context("reading the router")?
+        .context("reading the router")?;
     let text = String::from_utf8_lossy(&buf);
     let (head, resp_body) = match text.split_once("\r\n\r\n") {
         Some(parts) => parts,

@@ -7,8 +7,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
@@ -16,7 +14,7 @@ use clap::{Parser, Subcommand};
 use installer::cli::{self, arg::Instrumentation, CommandExecute};
 use installer::planner::Planner;
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 
@@ -162,9 +160,6 @@ struct Launch {
     /// Do not write ~/.pi/agent/models.json or settings.json
     #[clap(long)]
     no_configure: bool,
-    /// Leave a router we started running after Pi exits
-    #[clap(long)]
-    keep_server: bool,
     #[clap(flatten)]
     planner: Router,
     /// Arguments after `--` are passed to Pi
@@ -193,54 +188,48 @@ impl Launch {
         llamacpp::install::ensure(&APP, self.planner.clone()).await?;
         let offload = self.offload();
         let hf = llamacpp::catalog::flint_hf(offload)?;
-        eprintln!("llama-server -hf {hf}");
         let pi = which_pi()?;
-
-        // Stop leftover llama-server processes from earlier launches, then
-        // again when Pi exits (Drop, including Ctrl-C).
-        stop_our_llama_servers();
-        wait_port_free(&self.host, self.port).await;
-        let port = if tcp_open(&self.host, self.port).await {
-            let free = free_port(&self.host).await?;
-            eprintln!(
-                "{host}:{port} is in use; using {host}:{free}",
-                host = self.host,
-                port = self.port,
-            );
-            free
-        } else {
-            self.port
-        };
-        let mut child = self.start_server(port, &hf).await?;
-        let show = pipe_progress(&mut child);
-        let mut router = RouterProc {
-            child: &mut child,
-            keep: self.keep_server,
-        };
-        let base = common::router_url(&self.host, port);
-        let work = async {
-            wait_ready(&base, router.child).await?;
-            // Stop printing. llama-server request logs would land in Pi's composer.
-            show.store(false, Ordering::Relaxed);
-            let _ = io::stderr().write_all(b"\n");
-            let model = loaded_model(&base).await.unwrap_or_else(|_| hf.clone());
-            self.launch_pi(&base, &pi, &model).await
-        };
-        let result = tokio::select! {
-            result = work => result,
-            _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted")),
-        };
-        router.stop();
-        result
+        let base = common::router_url(&self.host, self.port);
+        self.ensure_server(&base, &hf).await?;
+        let model = loaded_model(&base).await.unwrap_or_else(|_| hf.clone());
+        self.launch_pi(&base, &pi, &model).await
     }
 
-    async fn start_server(&self, port: u16, hf: &str) -> anyhow::Result<Child> {
+    /// One llama-server on host:port. Already up → reuse. Already starting →
+    /// wait. Otherwise start it in the background and leave it running.
+    async fn ensure_server(&self, base: &str, hf: &str) -> anyhow::Result<()> {
+        if health_ok(base).await {
+            return Ok(());
+        }
+        if llama_server_running() {
+            eprintln!("waiting for llama-server on {base}");
+            return wait_ready(base, None, 0, None).await;
+        }
+        if tcp_open(&self.host, self.port).await {
+            anyhow::bail!("{base} is in use by something that is not llama-server");
+        }
+        eprintln!("llama-server -hf {hf}");
+        let log = common::dir().join("llama-server.log");
+        if let Some(dir) = log.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let offset = tokio::fs::metadata(&log).await.map(|m| m.len()).unwrap_or(0);
+        let child = self.start_server(hf, &log).await?;
+        wait_ready(base, Some(&log), offset, child.id()).await
+    }
+
+    async fn start_server(&self, hf: &str, log: &Path) -> anyhow::Result<Child> {
         let server = which_server()?;
+        let log_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .with_context(|| format!("opening {}", log.display()))?;
         let mut cmd = Command::new(&server);
         cmd.arg("--host")
             .arg(&self.host)
             .arg("--port")
-            .arg(port.to_string())
+            .arg(self.port.to_string())
             .arg("-hf")
             .arg(hf)
             .arg("-ngl")
@@ -249,9 +238,10 @@ impl Launch {
             cmd.arg("--ctx-size").arg(ctx.to_string());
         }
         cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(log_file.try_clone()?)
+            .stderr(log_file)
             .process_group(0)
+            .kill_on_drop(false)
             .spawn()
             .with_context(|| format!("spawning {}", server.display()))
     }
@@ -290,101 +280,30 @@ impl Launch {
     }
 }
 
-struct RouterProc<'a> {
-    child: &'a mut Child,
-    keep: bool,
-}
-
-impl RouterProc<'_> {
-    fn stop(&mut self) {
-        if self.keep {
-            return;
-        }
-        stop_group(self.child.id());
-        let _ = self.child.start_kill();
-        stop_our_llama_servers();
-    }
-}
-
-impl Drop for RouterProc<'_> {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// SIGKILL every process whose executable is our installed llama-server.
-/// That includes the router and the model children it forks.
-fn stop_our_llama_servers() {
+fn llama_server_running() -> bool {
     let Ok(server) = which_server() else {
-        return;
+        return false;
     };
     let Ok(want) = std::fs::canonicalize(&server) else {
-        return;
+        return false;
     };
     let Ok(proc) = std::fs::read_dir("/proc") else {
-        return;
+        return false;
     };
     let me = std::process::id();
-    for entry in proc.flatten() {
-        let pid: u32 = match entry.file_name().to_str().and_then(|s| s.parse().ok()) {
-            Some(pid) if pid != me => pid,
-            _ => continue,
+    proc.flatten().any(|entry| {
+        let Some(pid): Option<u32> = entry.file_name().to_str().and_then(|s| s.parse().ok()) else {
+            return false;
         };
-        let exe = match std::fs::read_link(entry.path().join("exe")) {
-            Ok(exe) => exe,
-            Err(_) => continue,
-        };
-        if exe == want {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
+        if pid == me {
+            return false;
         }
-    }
+        std::fs::read_link(entry.path().join("exe")).is_ok_and(|exe| exe == want)
+    })
 }
 
-fn stop_group(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        return;
-    };
-    unsafe {
-        libc::killpg(pid as i32, libc::SIGKILL);
-    }
-}
-
-/// Print llama-server output until the model is up, then drain it.
-fn pipe_progress(child: &mut Child) -> Arc<AtomicBool> {
-    let show = Arc::new(AtomicBool::new(true));
-    if let Some(stdout) = child.stdout.take() {
-        tokio::spawn(drain(stdout, show.clone()));
-    }
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(drain(stderr, show.clone()));
-    }
-    show
-}
-
-async fn drain(mut stream: impl tokio::io::AsyncRead + Unpin, show: Arc<AtomicBool>) {
-    let mut buf = [0u8; 4096];
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if show.load(Ordering::Relaxed) {
-                    let _ = io::stderr().write_all(&buf[..n]);
-                    let _ = io::stderr().flush();
-                }
-            }
-        }
-    }
-}
-
-async fn wait_port_free(host: &str, port: u16) {
-    for _ in 0..50 {
-        if !tcp_open(host, port).await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+fn pid_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).is_dir()
 }
 
 fn which_server() -> anyhow::Result<PathBuf> {
@@ -415,20 +334,57 @@ fn which(name: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// `-hf` llama-server only answers `/health` with `{"status":"ok"}` after the
-/// GGUF is loaded. A download keeps the port closed until then.
-async fn wait_ready(base: &str, child: &mut Child) -> anyhow::Result<()> {
+/// GGUF is loaded. A download keeps the port closed until then. New log bytes
+/// are copied to our stderr so progress is visible; once ready, Pi owns the TTY.
+async fn wait_ready(
+    base: &str,
+    log: Option<&Path>,
+    mut offset: u64,
+    pid: Option<u32>,
+) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2 * 60 * 60);
     loop {
-        if let Some(status) = child.try_wait()? {
-            anyhow::bail!("llama-server exited with {status}");
+        if let Some(pid) = pid {
+            if !pid_alive(pid) {
+                anyhow::bail!("llama-server exited");
+            }
+        } else if !llama_server_running() && !health_ok(base).await {
+            anyhow::bail!("llama-server on {base} exited");
+        }
+        if let Some(path) = log {
+            offset = tail(path, offset).await;
         }
         if health_ok(base).await {
+            if log.is_some() {
+                let _ = io::stderr().write_all(b"\n");
+            }
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("llama-server on {base} did not become ready");
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn tail(path: &Path, offset: u64) -> u64 {
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return offset;
+    };
+    if file.seek(std::io::SeekFrom::Start(offset)).await.is_err() {
+        return offset;
+    }
+    let mut buf = [0u8; 4096];
+    let mut pos = offset;
+    loop {
+        match file.read(&mut buf).await {
+            Ok(0) | Err(_) => return pos,
+            Ok(n) => {
+                let _ = io::stderr().write_all(&buf[..n]);
+                let _ = io::stderr().flush();
+                pos += n as u64;
+            }
+        }
     }
 }
 
@@ -457,15 +413,6 @@ async fn loaded_model(base: &str) -> anyhow::Result<String> {
 
 async fn tcp_open(host: &str, port: u16) -> bool {
     TcpStream::connect((host, port)).await.is_ok()
-}
-
-async fn free_port(host: &str) -> anyhow::Result<u16> {
-    for port in (9931..9991).chain(18080..18100) {
-        if !tcp_open(host, port).await {
-            return Ok(port);
-        }
-    }
-    anyhow::bail!("no free port for llama-server on {host}")
 }
 
 async fn configure_pi(base: &str, model: &str, context: Option<u64>) -> anyhow::Result<()> {

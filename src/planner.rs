@@ -30,7 +30,7 @@ pub struct Router {
     #[clap(long, env = "LLAMACPP_LLAMA_SHA256")]
     pub llama_sha256: Option<String>,
 
-    /// llama.cpp backend: `cpu`, `rocm` (AMD), or `vulkan`. Detected when omitted.
+    /// llama.cpp backend: `cpu`, `rocm` (AMD), `vulkan`, or `metal` (macOS). Detected when omitted.
     #[clap(long, env = "LLAMACPP_BACKEND")]
     pub backend: Option<String>,
 
@@ -84,13 +84,14 @@ impl Planner for Router {
             }
         };
         let pins = crate::catalog::pins()?;
+        let pi_release = pins.pi_for_host()?;
         let pi_sha = self
             .pi_sha256
             .clone()
-            .unwrap_or_else(|| pins.pi.sha256.clone());
+            .unwrap_or_else(|| pi_release.sha256.clone());
         let pi_archive = match &self.pi_tarball {
             Some(path) => ReleaseArchive::from_path(path, &pi_sha)?,
-            None => ReleaseArchive::from_url(Url::parse(&pins.pi.url)?, &pi_sha)?,
+            None => ReleaseArchive::from_url(Url::parse(&pi_release.url)?, &pi_sha)?,
         };
 
         let launcher_src = self.launcher_bin.clone().unwrap_or_else(|| {
@@ -177,10 +178,10 @@ impl Planner for Router {
     }
 
     async fn platform_check(&self) -> anyhow::Result<()> {
-        if !cfg!(target_os = "linux") {
-            anyhow::bail!("this installer targets Linux");
+        if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
+            return Ok(());
         }
-        Ok(())
+        anyhow::bail!("this installer targets Linux and macOS");
     }
 }
 
@@ -202,7 +203,8 @@ fn parse_backend(name: &str) -> anyhow::Result<crate::gpu::Backend> {
         "cpu" => Ok(crate::gpu::Backend::Cpu),
         "rocm" | "amd" | "hip" => Ok(crate::gpu::Backend::Rocm),
         "vulkan" => Ok(crate::gpu::Backend::Vulkan),
-        other => anyhow::bail!("unknown llama.cpp backend `{other}` (cpu, rocm, vulkan)"),
+        "metal" | "macos" | "apple" => Ok(crate::gpu::Backend::Metal),
+        other => anyhow::bail!("unknown llama.cpp backend `{other}` (cpu, rocm, vulkan, metal)"),
     }
 }
 

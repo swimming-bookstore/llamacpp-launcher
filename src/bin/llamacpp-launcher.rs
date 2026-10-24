@@ -349,7 +349,7 @@ fn our_llama_server(pid: u32) -> bool {
     let Ok(want) = std::fs::canonicalize(&server) else {
         return false;
     };
-    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| exe == want)
+    process_exe(pid).is_some_and(|exe| exe == want)
 }
 
 fn stop_server() -> anyhow::Result<()> {
@@ -382,19 +382,10 @@ fn our_llama_server_pids() -> Vec<u32> {
     let Ok(want) = std::fs::canonicalize(&server) else {
         return Vec::new();
     };
-    let Ok(proc) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
     let me = std::process::id();
-    proc.flatten()
-        .filter_map(|entry| {
-            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
-            if pid == me {
-                return None;
-            }
-            let exe = std::fs::read_link(entry.path().join("exe")).ok()?;
-            (exe == want).then_some(pid)
-        })
+    all_pids()
+        .into_iter()
+        .filter(|&pid| pid != me && process_exe(pid).is_some_and(|exe| exe == want))
         .collect()
 }
 
@@ -429,29 +420,79 @@ fn kill_pid(pid: u32) {
 }
 
 fn llama_server_running() -> bool {
-    let Ok(server) = which_server() else {
-        return false;
-    };
-    let Ok(want) = std::fs::canonicalize(&server) else {
-        return false;
-    };
-    let Ok(proc) = std::fs::read_dir("/proc") else {
-        return false;
-    };
-    let me = std::process::id();
-    proc.flatten().any(|entry| {
-        let Some(pid): Option<u32> = entry.file_name().to_str().and_then(|s| s.parse().ok()) else {
-            return false;
-        };
-        if pid == me {
-            return false;
-        }
-        std::fs::read_link(entry.path().join("exe")).is_ok_and(|exe| exe == want)
-    })
+    !our_llama_server_pids().is_empty()
 }
 
 fn pid_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).is_dir()
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn process_exe(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let n = unsafe {
+            libc::proc_pidpath(pid as i32, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
+        };
+        if n <= 0 {
+            return None;
+        }
+        let path = std::str::from_utf8(&buf[..n as usize]).ok()?;
+        Some(PathBuf::from(path))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn all_pids() -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(proc) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        proc.flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse().ok())
+            .collect()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let needed = unsafe { libc::proc_listpids(libc::PROC_ALL_PIDS, 0, std::ptr::null_mut(), 0) };
+        if needed <= 0 {
+            return Vec::new();
+        }
+        let cap = (needed as usize / std::mem::size_of::<i32>()).saturating_add(32);
+        let mut buf = vec![0i32; cap];
+        let bytes = unsafe {
+            libc::proc_listpids(
+                libc::PROC_ALL_PIDS,
+                0,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                (buf.len() * std::mem::size_of::<i32>()) as i32,
+            )
+        };
+        if bytes <= 0 {
+            return Vec::new();
+        }
+        let n = bytes as usize / std::mem::size_of::<i32>();
+        buf.into_iter()
+            .take(n)
+            .filter_map(|pid| (pid > 0).then_some(pid as u32))
+            .collect()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Vec::new()
+    }
 }
 
 fn which_server() -> anyhow::Result<PathBuf> {

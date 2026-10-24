@@ -14,12 +14,34 @@
       "vulkan": {
         "name": "llama-b11852-bin-ubuntu-vulkan-x64.tar.gz",
         "sha256": "0705bcc04f785e011db5bca92680f7fe3ba9bd08397d3d687e5ad4382e9e857d"
+      },
+      "macos-arm64": {
+        "name": "llama-b11852-bin-macos-arm64.tar.gz",
+        "sha256": "a02627e81f30e6eb9f72424c5556caf08fb0d018d593698fd0b6b18e1950b4cf"
+      },
+      "macos-x64": {
+        "name": "llama-b11852-bin-macos-x64.tar.gz",
+        "sha256": "db1899be63b05abb9dc44192c7b8e3bd22255f15bb29623edb5d384caa36ce15"
       }
     }
   },
   "pi": {
-    "url": "https://github.com/badlogic/pi-mono/releases/download/v1.4.0/pi-linux-x64.tar.gz",
-    "sha256": "f2e4e4329603223d03260cdb8bd5033dbdc1f73ba58ab8939db2e56546e115d2"
+    "linux-x64": {
+      "url": "https://github.com/badlogic/pi-mono/releases/download/v1.4.0/pi-linux-x64.tar.gz",
+      "sha256": "f2e4e4329603223d03260cdb8bd5033dbdc1f73ba58ab8939db2e56546e115d2"
+    },
+    "linux-arm64": {
+      "url": "https://github.com/badlogic/pi-mono/releases/download/v1.4.0/pi-linux-arm64.tar.gz",
+      "sha256": "fa5829c7ef83ffeaebba015715c8306220f89b2aa8a00154efbba98dd5440156"
+    },
+    "darwin-arm64": {
+      "url": "https://github.com/badlogic/pi-mono/releases/download/v1.4.0/pi-darwin-arm64.tar.gz",
+      "sha256": "79d9979d76a2a5adb7c28e27e9b44629928ccd0dc9fbb6ae7217860bd5e8be5d"
+    },
+    "darwin-x64": {
+      "url": "https://github.com/badlogic/pi-mono/releases/download/v1.4.0/pi-darwin-x64.tar.gz",
+      "sha256": "1bdefc9e1074c1de458ea9f2e43e6013ce49cd05326009b3de144037036585e2"
+    }
   },
   "flint": {
     "repo": "ggml-org/Flint-GGUF",

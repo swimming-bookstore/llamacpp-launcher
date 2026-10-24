@@ -1,10 +1,10 @@
 //! Which llama.cpp build to fetch, and whether the router should use the GPU.
 //!
 //! An AMD card gets the ROCm build from the pinned release. Vulkan is the
-//! fallback when there is no ROCm device but a Vulkan ICD is present. Anything
-//! else stays on the CPU build. A card with a lot of video memory offloads
-//! layers; a small one does not, so a 22 GB model is not forced into a few GB
-//! of VRAM.
+//! fallback when there is no ROCm device but a Vulkan ICD is present. macOS
+//! uses the Metal build. Anything else stays on the CPU build. A card with a
+//! lot of video memory offloads layers; a small one does not, so a 22 GB model
+//! is not forced into a few GB of VRAM.
 
 use std::path::Path;
 
@@ -25,11 +25,13 @@ pub enum Backend {
     /// AMD ROCm. Needs `/dev/kfd` or a ROCm install, not just an AMD PCI id.
     Rocm,
     Vulkan,
+    /// Apple Metal. The macOS llama.cpp builds include it.
+    Metal,
 }
 
 impl Backend {
     pub fn asset(self) -> anyhow::Result<Asset> {
-        crate::catalog::pins()?.llama(self.label())
+        crate::catalog::pins()?.llama_for_host(self.label())
     }
 
     pub fn label(self) -> &'static str {
@@ -37,6 +39,7 @@ impl Backend {
             Backend::Cpu => "cpu",
             Backend::Rocm => "rocm",
             Backend::Vulkan => "vulkan",
+            Backend::Metal => "metal",
         }
     }
 }
@@ -47,12 +50,21 @@ pub struct Machine {
     pub backend: Backend,
     /// Largest video memory seen, in bytes. `None` when it could not be read.
     pub vram: Option<u64>,
-    /// Total RAM from `/proc/meminfo`. `None` when it could not be read.
+    /// Total RAM. `None` when it could not be read.
     pub ram: Option<u64>,
 }
 
 impl Machine {
     pub fn detect() -> Self {
+        if cfg!(target_os = "macos") {
+            let ram = ram();
+            // Apple Silicon is unified memory; Intel Macs still run the Metal build.
+            return Self {
+                backend: Backend::Metal,
+                vram: ram,
+                ram,
+            };
+        }
         let gpus = drm_gpus();
         let amd = gpus.iter().any(|gpu| gpu.amd);
         let vram = gpus.iter().filter_map(|gpu| gpu.vram).max();
@@ -87,15 +99,38 @@ struct DrmGpu {
 }
 
 fn ram() -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in text.lines() {
-        let Some(rest) = line.strip_prefix("MemTotal:") else {
-            continue;
-        };
-        let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-        return Some(kb * 1024);
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in text.lines() {
+            let Some(rest) = line.strip_prefix("MemTotal:") else {
+                continue;
+            };
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+        None
     }
-    None
+    #[cfg(target_os = "macos")]
+    {
+        let mut value: u64 = 0;
+        let mut size = std::mem::size_of::<u64>();
+        let name = std::ffi::CString::new("hw.memsize").ok()?;
+        let ret = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut value as *mut u64 as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (ret == 0).then_some(value)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
 }
 
 fn drm_gpus() -> Vec<DrmGpu> {
@@ -156,8 +191,19 @@ mod tests {
 
     #[test]
     fn rocm_asset_is_the_pinned_amd_build() {
-        let asset = Backend::Rocm.asset().unwrap();
+        let asset = crate::catalog::pins().unwrap().llama("rocm").unwrap();
         assert!(asset.name.contains("rocm"));
+        assert!(asset.url.contains("/b11852/"));
+        assert_eq!(asset.sha256.len(), 64);
+    }
+
+    #[test]
+    fn macos_arm64_asset_is_the_pinned_metal_build() {
+        let asset = crate::catalog::pins()
+            .unwrap()
+            .llama("macos-arm64")
+            .unwrap();
+        assert!(asset.name.contains("macos-arm64"));
         assert!(asset.url.contains("/b11852/"));
         assert_eq!(asset.sha256.len(), 64);
     }
@@ -179,9 +225,15 @@ mod tests {
             vram: Some(16 * 1024 * 1024 * 1024),
             ram: None,
         };
+        let metal = Machine {
+            backend: Backend::Metal,
+            vram: Some(16 * 1024 * 1024 * 1024),
+            ram: Some(16 * 1024 * 1024 * 1024),
+        };
         assert!(!small.offload());
         assert!(!unknown.offload());
         assert!(large.offload());
+        assert!(metal.offload());
         assert!(!Machine {
             backend: Backend::Cpu,
             vram: Some(LARGE_VRAM),

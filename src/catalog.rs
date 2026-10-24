@@ -2,6 +2,7 @@
 //! Flint is `ggml-org/Flint-GGUF`; the quant (Q4, Q8, BF16) is picked from RAM
 //! (plus VRAM when layers go to the GPU) and passed as `-hf repo:quant`.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Context;
@@ -15,7 +16,7 @@ const HEADROOM_GIB: u64 = 8;
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Pins {
     pub llama: LlamaRelease,
-    pub pi: PiRelease,
+    pub pi: HashMap<String, PiRelease>,
     pub flint: Flint,
 }
 
@@ -31,6 +32,10 @@ pub struct LlamaAssets {
     pub cpu: LlamaFile,
     pub rocm: LlamaFile,
     pub vulkan: LlamaFile,
+    #[serde(rename = "macos-arm64")]
+    pub macos_arm64: LlamaFile,
+    #[serde(rename = "macos-x64")]
+    pub macos_x64: LlamaFile,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -63,6 +68,8 @@ impl Pins {
             "cpu" => &self.llama.assets.cpu,
             "rocm" => &self.llama.assets.rocm,
             "vulkan" => &self.llama.assets.vulkan,
+            "macos-arm64" | "metal-arm64" => &self.llama.assets.macos_arm64,
+            "macos-x64" | "metal-x64" => &self.llama.assets.macos_x64,
             other => anyhow::bail!("no llama.cpp asset for `{other}`"),
         };
         let url = self
@@ -75,6 +82,18 @@ impl Pins {
             sha256: file.sha256.clone(),
             url,
         })
+    }
+
+    /// llama.cpp build for this OS, arch, and backend.
+    pub fn llama_for_host(&self, backend: &str) -> anyhow::Result<crate::gpu::Asset> {
+        self.llama(llama_key(backend)?)
+    }
+
+    pub fn pi_for_host(&self) -> anyhow::Result<&PiRelease> {
+        let key = host_target()?;
+        self.pi
+            .get(key)
+            .with_context(|| format!("catalog.json pi.{key} is missing"))
     }
 }
 
@@ -94,14 +113,22 @@ fn load_file(path: &Path) -> anyhow::Result<Pins> {
 
 fn parse(text: &str) -> anyhow::Result<Pins> {
     let pins: Pins = serde_json::from_str(text).context("catalog.json")?;
-    require_sha256("pi.sha256", &pins.pi.sha256)?;
-    if pins.pi.url.is_empty() {
-        anyhow::bail!("catalog.json pi.url is missing");
+    for key in ["linux-x64", "linux-arm64", "darwin-arm64", "darwin-x64"] {
+        let pi = pins
+            .pi
+            .get(key)
+            .with_context(|| format!("catalog.json pi.{key} is missing"))?;
+        require_sha256(&format!("pi.{key}.sha256"), &pi.sha256)?;
+        if pi.url.is_empty() {
+            anyhow::bail!("catalog.json pi.{key}.url is missing");
+        }
     }
     for (backend, file) in [
         ("cpu", &pins.llama.assets.cpu),
         ("rocm", &pins.llama.assets.rocm),
         ("vulkan", &pins.llama.assets.vulkan),
+        ("macos-arm64", &pins.llama.assets.macos_arm64),
+        ("macos-x64", &pins.llama.assets.macos_x64),
     ] {
         if file.name.is_empty() {
             anyhow::bail!("catalog.json llama.assets.{backend}.name is missing");
@@ -119,6 +146,31 @@ fn require_sha256(field: &str, value: &str) -> anyhow::Result<()> {
         Ok(())
     } else {
         anyhow::bail!("catalog.json {field} must be 64 hex chars")
+    }
+}
+
+fn host_target() -> anyhow::Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("linux-x64"),
+        ("linux", "aarch64") => Ok("linux-arm64"),
+        ("macos", "aarch64") => Ok("darwin-arm64"),
+        ("macos", "x86_64") => Ok("darwin-x64"),
+        (os, arch) => anyhow::bail!("no pinned Pi build for {os}-{arch}"),
+    }
+}
+
+fn llama_key(backend: &str) -> anyhow::Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH, backend) {
+        ("macos", "aarch64", "cpu" | "metal") => Ok("macos-arm64"),
+        ("macos", "x86_64", "cpu" | "metal") => Ok("macos-x64"),
+        ("macos", _, other) => {
+            anyhow::bail!("no llama.cpp asset for `{other}` on macOS (cpu, metal)")
+        }
+        ("linux", _, "cpu") => Ok("cpu"),
+        ("linux", _, "rocm") => Ok("rocm"),
+        ("linux", _, "vulkan") => Ok("vulkan"),
+        ("linux", _, other) => anyhow::bail!("no llama.cpp asset for `{other}` on Linux"),
+        (os, arch, _) => anyhow::bail!("no pinned llama.cpp build for {os}-{arch}"),
     }
 }
 
@@ -157,7 +209,12 @@ mod tests {
         assert!(rocm.name.contains("rocm"));
         assert!(rocm.url.contains("/b11852/"));
         assert_eq!(rocm.sha256.len(), 64);
-        assert!(pins.pi.url.contains("pi-mono"));
+        let macos = pins.llama("macos-arm64").unwrap();
+        assert!(macos.name.contains("macos-arm64"));
+        assert_eq!(macos.sha256.len(), 64);
+        let pi = pins.pi.get("linux-x64").unwrap();
+        assert!(pi.url.contains("pi-mono"));
+        assert!(pins.pi.contains_key("darwin-arm64"));
         assert_eq!(pins.flint.repo, "ggml-org/Flint-GGUF");
     }
 

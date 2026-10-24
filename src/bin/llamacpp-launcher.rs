@@ -1,4 +1,4 @@
-//! `llamacpp-launcher launch pi`
+//! `llamacpp-launcher launch pi --model flint`
 //!
 //! Installs llama.cpp under `~/.llamacpp-launcher/llama` and Pi into
 //! `~/.local/bin` if they are missing, starts the router, and execs Pi.
@@ -139,6 +139,9 @@ impl CommandExecute for Uninstall {
 struct Launch {
     /// Coding agent to start. Only `pi` is supported.
     agent: String,
+    /// Model to load. Only `flint` is supported; Q4 / Q8 / BF16 is picked from RAM.
+    #[clap(long)]
+    model: String,
     #[clap(long, default_value = DEFAULT_HOST)]
     host: String,
     #[clap(long, default_value_t = DEFAULT_PORT)]
@@ -180,6 +183,9 @@ impl Launch {
     async fn run(self) -> anyhow::Result<()> {
         if self.agent != "pi" {
             anyhow::bail!("only `pi` is supported (got `{}`)", self.agent);
+        }
+        if !self.model.eq_ignore_ascii_case("flint") {
+            anyhow::bail!("only `flint` is supported (got `{}`)", self.model);
         }
         llamacpp::install::ensure(&APP, self.planner.clone()).await?;
         let offload = self.offload();

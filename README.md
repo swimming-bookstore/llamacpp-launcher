@@ -1,7 +1,7 @@
 # llamacpp-launcher
 
 ```
-llamacpp-launcher launch pi
+llamacpp-launcher launch pi --model flint
 ```
 
 Installs llama.cpp under `~/.llamacpp-launcher/llama` and Pi into `~/.local/bin` if needed, starts the router, and runs Pi. No root.

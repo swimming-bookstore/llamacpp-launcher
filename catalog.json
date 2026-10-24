@@ -1,0 +1,31 @@
+{
+  "llama": {
+    "tag": "b11852",
+    "url": "https://github.com/ggml-org/llama.cpp/releases/download/{tag}/{name}",
+    "assets": {
+      "cpu": {
+        "name": "llama-b11852-bin-ubuntu-x64.tar.gz",
+        "sha256": "6ec84fd5ddf5bee393d27384b9b6acb19a35cbac71b0d22b4d73fc727363fcca"
+      },
+      "rocm": {
+        "name": "llama-b11852-bin-ubuntu-rocm-10.0-x64.tar.gz",
+        "sha256": "7996c4e21a1908f63e379c562b3fceb22334b00bdcf36cfcce9469a1b5d120a0"
+      },
+      "vulkan": {
+        "name": "llama-b11852-bin-ubuntu-vulkan-x64.tar.gz",
+        "sha256": "0705bcc04f785e011db5bca92680f7fe3ba9bd08397d3d687e5ad4382e9e857d"
+      }
+    }
+  },
+  "pi": {
+    "url": "https://github.com/badlogic/pi-mono/releases/download/v1.4.0/pi-linux-x64.tar.gz",
+    "sha256": "f2e4e4329603223d03260cdb8bd5033dbdc1f73ba58ab8939db2e56546e115d2"
+  },
+  "models": {
+    "flint": {
+      "id": "Flint-Q4_K_M",
+      "repo": "ggml-org/Flint-GGUF",
+      "file": "Flint-Q4_K_M.gguf"
+    }
+  }
+}

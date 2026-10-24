@@ -1,0 +1,18 @@
+[package]
+name = "llamacpp"
+description = "Launch Pi against a local llama.cpp router"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+installer = { git = "https://github.com/swimming-bookstore/installer" }
+anyhow = { version = "1", default-features = false, features = ["std"] }
+async-trait = { version = "0.1", default-features = false }
+clap = { version = "4", features = ["std", "color", "usage", "help", "error-context", "suggestions", "derive", "env"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["process", "fs", "signal", "rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+typetag = { version = "0.2", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+url = { version = "2", default-features = false, features = ["serde"] }

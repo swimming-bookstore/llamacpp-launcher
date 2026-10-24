@@ -209,7 +209,11 @@ impl Launch {
         };
         let mut child = self.start_router(port).await?;
         let base = common::router_url(&self.host, port);
-        let result = self.launch_pi(&base, &pi, &resolved).await;
+        let result = async {
+            wait_loaded(&base, &mut child).await?;
+            self.launch_pi(&base, &pi, &resolved).await
+        }
+        .await;
         if !self.keep_server {
             let _ = child.kill().await;
             let _ = child.wait().await;
@@ -267,8 +271,6 @@ impl Launch {
         pi: &Path,
         resolved: &llamacpp::catalog::Resolved,
     ) -> anyhow::Result<()> {
-        // Do not wait for the GGUF. llama-server loads it in the background, and
-        // /v1/models can hang the whole time. Pi only needs models.json.
         if !self.no_configure {
             configure_pi(base, &resolved.id, self.ctx.map(u64::from)).await?;
         }
@@ -350,6 +352,38 @@ async fn probe(base: &str) -> bool {
     };
     let status = value.get("status").and_then(|v| v.as_str());
     status == Some("ok") || value.get("models").is_some() || status == Some("no slot available")
+}
+
+/// llama-server's `/health` is `{"status":"ok"}` only after a model is up.
+/// A models object means the router is listening, not that the GGUF is ready.
+async fn model_ready(base: &str) -> bool {
+    let Ok(body) = http(base, "GET", "/health", None).await else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(body.trim()) else {
+        return false;
+    };
+    matches!(
+        value.get("status").and_then(|v| v.as_str()),
+        Some("ok") | Some("no slot available")
+    )
+}
+
+async fn wait_loaded(base: &str, child: &mut Child) -> anyhow::Result<()> {
+    eprintln!("waiting for the model");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2 * 60 * 60);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("llama-server exited with {status}");
+        }
+        if model_ready(base).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("model on {base} did not finish loading");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 async fn tcp_open(host: &str, port: u16) -> bool {
